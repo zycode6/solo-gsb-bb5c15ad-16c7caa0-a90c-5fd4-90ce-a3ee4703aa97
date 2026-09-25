@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # 租约与按资源键的并发容量占用共用同一组 TTL 边界 / 默认值
+      LEASE_MIN_TTL_MS: "100"
+      LEASE_MAX_TTL_MS: "300000"
+      LEASE_DEFAULT_TTL_MS: "10000"
+      # 每个任务键的租约审计 Stream 保留的最新事件条数（0=不限制）
+      LEASE_EVENT_RETENTION: "1000"
+      # 全局任务结果变更 Stream（/v1/results/changes）保留的最新变更条数（0=不限制）
+      LEASE_RESULT_CHANGE_RETENTION: "10000"
+      LIMIT_KEY_PREFIX: "ratelimit"
+      LIMIT_IDEM_KEY_PREFIX: "ratelimit-idem"
+      LIMITS_MIN_WINDOW_MS: "1"
+      LIMITS_MAX_WINDOW_MS: "86400000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
