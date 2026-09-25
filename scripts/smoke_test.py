@@ -22,7 +22,10 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 失败（凭据 / result_conflict / stale_dependencies）与相同内容重放不追加 /
 变更含 task_key、防栅序号、提交时间与当次 JSON 结果 / 跨任务键按写入全局
 定序 / cursor + next_cursor 分页不重不漏 / 早于最早保留条目的游标 410 /
-非法 cursor 400、limit 越界 422 / 路由优先于 {task_key} 捕获；
+非法 cursor 400、limit 越界 422 / 路由优先于 {task_key} 捕获，以及游标裁剪
+竞态：恰满一页（末页 next_cursor=null、满页可继续翻页、按写入顺序衔接不
+重复）、小保留窗口下并发 XADD MAXLEN 持续裁剪时任何 200 页面与读取前快照
+逐条衔接且失效游标仍返回 410（不静默漏读）、空流（含带游标）空页 200；
 以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
@@ -67,6 +70,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1028,6 +1032,212 @@ def result_changes_checks():
     check("changes limit 0 -> 422", code == 422, f"code={code}")
     code, _ = fetch_changes(limit=201)
     check("changes limit >200 -> 422", code == 422, f"code={code}")
+
+    result_changes_race_checks()
+
+
+def result_changes_race_checks():
+    """/v1/results/changes 游标裁剪竞态回归（单 Lua 原子读取）：
+
+    - 恰满一页：满页且后面还有条目 -> next_cursor 指向本页末条；
+      满页恰好是最后一页 -> next_cursor 为 null；按写入顺序衔接且不重复。
+    - 并发裁剪：小保留窗口下并发提交持续 XADD MAXLEN 裁剪旧条目，
+      任何 200 页面都必须与读取前一刻的流快照逐条衔接（不得静默漏读），
+      游标早于该快照最早条目时返回 410。
+    - 空流语义：流为空时（含带游标）返回 200 空页，沿用既有语义。
+    """
+    base = f"smoke-changes-race:{int(time.time() * 1000)}"
+    prefix = os.environ.get("SMOKE_KEY_PREFIX", "lease")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+    stream = f"{prefix}:result-changes"
+
+    def commit(k, result):
+        code, a = call("POST", "/v1/leases/acquire",
+                       {"task_key": k, "ttl_ms": 60_000})
+        if code != 200 or not a.get("acquired"):
+            return code, a
+        return call("POST", "/v1/results/commit",
+                    {"task_key": k, "token": a["token"],
+                     "fencing_token": a["fencing_token"], "result": result})
+
+    # ---- 恰满一页（确定性，本进程内此刻无并发提交）----
+    keys = [f"{base}:full:{i}" for i in range(4)]
+    for i, k in enumerate(keys):
+        code, c = commit(k, {"seq": i})
+        check("race full-page setup commit",
+              code == 200 and c["committed"], f"{code} {c}")
+    code, snap = fetch_changes(limit=200)
+    all_entries = snap["changes"]
+    mine = [ch for ch in all_entries if ch["task_key"] in keys]
+    check("race full-page setup visible", len(mine) == 4, f"{mine}")
+    full_ids = [ch["id"] for ch in mine]
+    # cursor 为"上次最后一条"（排他）：取本块首条的前一条作为锚点，
+    # 本块恰为流首时不带游标
+    start_idx = next(i for i, ch in enumerate(all_entries)
+                     if ch["id"] == full_ids[0])
+    anchor = all_entries[start_idx - 1]["id"] if start_idx > 0 else None
+
+    # limit=4 恰好满页且后面没有更多条目 -> next_cursor 为 null
+    code, p = fetch_changes(anchor, 4)
+    check("race exact full page is last page",
+          code == 200 and [ch["id"] for ch in p["changes"]] == full_ids
+          and p["next_cursor"] is None, f"{p}")
+
+    # limit=3 满页且后面还有 1 条 -> next_cursor 指向本页末条，下一页恰好衔接
+    code, p = fetch_changes(anchor, 3)
+    check("race full page with more gives cursor",
+          code == 200 and [ch["id"] for ch in p["changes"]] == full_ids[:3]
+          and p["next_cursor"] == full_ids[2], f"{p}")
+    code, p2 = fetch_changes(p["next_cursor"], 3)
+    check("race page after full page continues in order",
+          code == 200 and [ch["id"] for ch in p2["changes"]] == full_ids[3:]
+          and p2["next_cursor"] is None, f"{p2}")
+
+    # limit=2 两页衔接：不重不漏、ID 严格递增
+    code, q1 = fetch_changes(anchor, 2)
+    check("race first of two full pages",
+          code == 200 and [ch["id"] for ch in q1["changes"]] == full_ids[:2]
+          and q1["next_cursor"] == full_ids[1], f"{q1}")
+    code, q2 = fetch_changes(q1["next_cursor"], 2)
+    joined = [ch["id"] for ch in q1["changes"]] + [
+        ch["id"] for ch in q2["changes"]]
+    check("race full pages join without dup/gap",
+          code == 200 and joined == full_ids and q2["next_cursor"] is None,
+          f"{q1} {q2}")
+
+    # ---- 并发裁剪：小保留窗口（MAXLEN=10）下持续提交裁剪 ----
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("race redis reachable", False, f"{host}:{port} {exc}")
+        return
+    try:
+        keep = 10
+        page_limit = 5
+        stop = threading.Event()
+        pause = threading.Event()
+
+        def trimmer(idx):
+            client = _RespClient(host, port)
+            n = 0
+            try:
+                while not stop.is_set():
+                    if pause.is_set():
+                        time.sleep(0.005)
+                        continue
+                    n += 1
+                    client.execute(
+                        "XADD", stream, "MAXLEN", keep, "*",
+                        "task_key", f"{base}:trimmer:{idx}:{n}",
+                        "fencing", str(n),
+                        "committed_at_ms", "0",
+                        "result", "null")
+                    # 限速到约 2k 条 / 秒：让裁剪既有概率落在 HTTP 请求之前
+                    # （410 分支），也有概率落在旧实现"最早条目校验 -> 页面
+                    # 读取"的往返之间（旧实现 200 静默漏读分支）
+                    time.sleep(0.008)
+            except (OSError, RuntimeError):
+                pass
+            finally:
+                client.close()
+
+        threads = [threading.Thread(target=trimmer, args=(i,), daemon=True)
+                   for i in range(16)]
+        for t in threads:
+            t.start()
+        try:
+            # 等流进入"满窗"稳态：达到 keep 条后每次 XADD 都裁掉最旧条目
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if r.execute("XLEN", stream) >= keep:
+                    break
+                time.sleep(0.01)
+            xlen = r.execute("XLEN", stream)
+            check("race stream reached steady window", xlen >= keep,
+                  f"XLEN={xlen}")
+
+            # 强制 410：暂停裁剪 -> 快照 -> 再写一条裁掉快照游标 -> 读取
+            # 旧实现（先查最早、再分两次读取）可能在裁剪窗口内得到 200 静默漏读
+            pause.set()
+            time.sleep(0.05)
+            snap0 = r.execute("XRANGE", stream, "-", "+")
+            stale_cursor = snap0[0][0]
+            r.execute("XADD", stream, "MAXLEN", keep, "*",
+                      "task_key", f"{base}:force-trim", "fencing", "1",
+                      "committed_at_ms", "0", "result", "null")
+            code, body = fetch_changes(stale_cursor, page_limit)
+            check("race cursor trimmed between -> 410",
+                  code == 410 and isinstance(body.get("detail"), str),
+                  f"{code} {body}")
+
+            # 强制 200：暂停裁剪后从快照最早条目起读，第一页满页且后面还有
+            # 条目 -> next_cursor 非空；第二页承接剩余条目且为最后一页
+            snap1 = r.execute("XRANGE", stream, "-", "+")
+            code, p = fetch_changes(snap1[0][0], page_limit)
+            check("race fresh cursor first page joins snapshot",
+                  code == 200 and [ch["id"] for ch in p["changes"]]
+                  == [e[0] for e in snap1[1:1 + page_limit]]
+                  and p["next_cursor"] == snap1[page_limit][0], f"{code} {p}")
+            code, p = fetch_changes(p["next_cursor"], page_limit)
+            check("race fresh cursor second page joins in order",
+                  code == 200 and [ch["id"] for ch in p["changes"]]
+                  == [e[0] for e in snap1[page_limit + 1:]]
+                  and p["next_cursor"] is None, f"{code} {p}")
+
+            # 压力轮次：每轮先直连快照再发起读取。410 合法（快照后游标已被裁）；
+            # 200 时页面必须与快照逐条一致——旧实现的静默漏读必在此暴露
+            pause.clear()
+            saw_410 = False
+            saw_200 = False
+            consistent = True
+            rounds = 400
+            for _ in range(rounds):
+                snap_i = r.execute("XRANGE", stream, "-", "+")
+                code, p = fetch_changes(snap_i[0][0], page_limit)
+                expected = [e[0] for e in snap_i[1:1 + page_limit]]
+                if code == 410:
+                    saw_410 = True
+                elif not (code == 200 and len(p["changes"]) == page_limit
+                          and [ch["id"] for ch in p["changes"]] == expected
+                          and p["next_cursor"] == snap_i[page_limit][0]):
+                    consistent = False
+                    break
+                else:
+                    saw_200 = True
+            check("race hammer page consistent with snapshot",
+                  consistent,
+                  "a 200 page missed entries trimmed between checks"
+                  if not consistent else "")
+            check("race hammer exercised 410 under concurrent trims",
+                  saw_410)
+            check("race hammer exercised 200 under concurrent trims",
+                  saw_200)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=5)
+    finally:
+        r.close()
+
+    # ---- 空流语义：清空后无游标 / 带游标均为 200 空页（不判 410）----
+    try:
+        r2 = _RespClient(host, port)
+    except OSError as exc:
+        check("race redis reachable (empty)", False, f"{host}:{port} {exc}")
+        return
+    try:
+        r2.execute("DEL", stream)
+        code, p = fetch_changes(limit=5)
+        check("race empty stream no cursor -> empty page",
+              code == 200 and p["changes"] == [] and p["next_cursor"] is None,
+              f"{code} {p}")
+        code, p = fetch_changes("1-0", 5)
+        check("race empty stream with cursor -> empty page",
+              code == 200 and p["changes"] == [] and p["next_cursor"] is None,
+              f"{code} {p}")
+    finally:
+        r2.close()
 
 
 def _id_tuple(entry_id):

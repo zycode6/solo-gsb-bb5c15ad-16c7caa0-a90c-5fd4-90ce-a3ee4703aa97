@@ -78,6 +78,11 @@
   因此一条变更恰好对应结果 Hash 的一次版本推进。
 - retention > 0 时以 XADD MAXLEN 精确裁剪，全局流只保留最新的 retention 条，
   超出部分从最旧变更丢弃；retention = 0 表示不限制。
+- 分页读取（GET /v1/results/changes）由单个只读 Lua 脚本在同一次 Redis
+  原子执行内完成"最早保留条目校验（游标更早即 410）-> 按 (cursor, limit]
+  读取页面 -> 恰满一页时探测后续条目决定 next_cursor"：三步共用同一份流
+  快照，并发提交触发的 MAXLEN 裁剪不可能落在校验与读取之间，失效游标不会
+  得到 200 而静默漏读。
 
 按资源键分配并发容量约定（多工作进程共享有上限的处理槽位）：
 - 容量配置键 {prefix}:capacity:{resource_key} 是一个 String（整数权重容量，
@@ -602,6 +607,75 @@ end
 """
     + _RESULT_COMMIT_TAIL_LUA
 )
+
+# 全局结果变更流的分页读取（只读）：最早保留条目校验、按 (cursor, limit] 读取
+# 页面与 next_cursor 探测在同一次脚本执行内完成。Lua 脚本原子执行，三步之间
+# 不可能插入并发的 XADD MAXLEN 裁剪，因此"游标早于当前最早保留条目"的判定与
+# 页面读取基于同一份流快照，不会出现"校验时未过期、读取时已被裁剪"的静默
+# 漏读窗口。游标格式（<毫秒>-<序号>）由服务端先行校验，本脚本只负责比较与读取。
+# KEYS[1] = 全局结果变更流键
+# ARGV[1] = 游标（空串表示无游标，从最早保留条目读起）
+# ARGV[2] = limit（1～200）
+# 游标过期返回 {'410'}（空流沿用空页语义，不判 410）；
+# 正常返回 {'200', 条目数, id_1, task_key_1, fencing_1, committed_at_ms_1,
+#   result_1, ..., next_cursor（无下一页为空串）}
+RESULT_CHANGES_PAGE_LUA = """
+local stream = KEYS[1]
+local cursor = ARGV[1]
+local limit = tonumber(ARGV[2])
+
+local function id_tuple(id)
+  local dash = string.find(id, '-', 1, true)
+  return tonumber(string.sub(id, 1, dash - 1)),
+    tonumber(string.sub(id, dash + 1))
+end
+
+local function id_before(a, b)
+  local ams, aseq = id_tuple(a)
+  local bms, bseq = id_tuple(b)
+  return ams < bms or (ams == bms and aseq < bseq)
+end
+
+-- 最早保留条目校验与后续读取共用同一份流快照：游标更早即 410，调用方应
+-- 不带游标从当前最早条目重新追赶；空流不判 410（沿用空页语义）
+local min_id = '-'
+if cursor ~= '' then
+  local oldest = redis.call('XRANGE', stream, '-', '+', 'COUNT', 1)
+  if #oldest > 0 and id_before(cursor, oldest[1][1]) then
+    return {'410'}
+  end
+  min_id = '(' .. cursor
+end
+
+-- 游标语义为"上次最后一条"，'(' 排除其本身，避免重复 / 漏读
+local page = redis.call('XRANGE', stream, min_id, '+', 'COUNT', limit)
+
+local next_cursor = ''
+if #page == limit then
+  -- 本页恰好满 limit：同一原子读内探测其后是否还有条目可翻
+  local probe = redis.call('XRANGE', stream,
+    '(' .. page[#page][1], '+', 'COUNT', 1)
+  if #probe > 0 then
+    next_cursor = page[#page][1]
+  end
+end
+
+local reply = {'200', #page}
+for _, entry in ipairs(page) do
+  local fields = {}
+  local f = entry[2]
+  for i = 1, #f, 2 do
+    fields[f[i]] = f[i + 1]
+  end
+  reply[#reply + 1] = entry[1]
+  reply[#reply + 1] = fields['task_key']
+  reply[#reply + 1] = fields['fencing']
+  reply[#reply + 1] = fields['committed_at_ms']
+  reply[#reply + 1] = fields['result']
+end
+reply[#reply + 1] = next_cursor
+return reply
+"""
 
 # 保存任务依赖定义：先按"现有定义"做环检测，再整体替换，全成全败。
 # 依赖定义是一个 Redis List（每项为一个前置任务键，顺序即请求顺序）：
