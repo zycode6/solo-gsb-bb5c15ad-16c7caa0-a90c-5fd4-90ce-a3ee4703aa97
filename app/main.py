@@ -34,6 +34,7 @@ from .lua import (
     RELEASE_LUA,
     RENEW_BATCH_LUA,
     RENEW_LUA,
+    RESULT_CHANGES_READ_LUA,
     RESULT_COMMIT_CHECKED_LUA,
     RESULT_COMMIT_LUA,
     TRANSFER_LUA,
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
         validate=redis.register_script(VALIDATE_LUA),
         result_commit=redis.register_script(RESULT_COMMIT_LUA),
         result_commit_checked=redis.register_script(RESULT_COMMIT_CHECKED_LUA),
+        result_changes_read=redis.register_script(RESULT_CHANGES_READ_LUA),
         dependency_snapshot=redis.register_script(DEPENDENCY_SNAPSHOT_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
         dependency_set=redis.register_script(DEPENDENCY_SET_LUA),
@@ -196,12 +198,6 @@ def slots_used_key(settings: Settings, resource_key: str) -> str:
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
 _STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
-
-
-def _stream_id_tuple(entry_id: str) -> tuple[int, int]:
-    """把 Redis Stream 条目 ID（"<毫秒>-<序号>"）解析为可比较的元组。"""
-    ms, seq = entry_id.split("-", 1)
-    return int(ms), int(seq)
 
 
 def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
@@ -772,7 +768,7 @@ async def commit_result_checked(
     },
 )
 async def list_result_changes(
-    redis: RedisDep,
+    scripts: ScriptsDep,
     settings: SettingsDep,
     cursor: str | None = Query(
         default=None,
@@ -803,6 +799,10 @@ async def list_result_changes(
     - 传入的 `cursor` **早于当前保留的最早条目**（已被裁剪）时返回 **410**，
       提示游标失效、避免静默漏读；调用方应从当前最早条目重新追赶
       （不带 `cursor`）或改走全量对账。
+    - 最早保留条目校验、按 `cursor` / `limit` 读页与 `next_cursor` 判定由
+      **单个只读 Lua 脚本**在同一次 Redis 原子调用内完成：三步基于同一快照，
+      保留条数较小、并发提交在读取过程中裁剪旧条目时，失效游标必然得到
+      **410**，而不会在校验与读页之间悄然失效、拿到 200 静默漏读。
     """
     if cursor is not None and not _STREAM_ID_PATTERN.match(cursor):
         raise HTTPException(
@@ -810,45 +810,37 @@ async def list_result_changes(
             detail="cursor must be a Redis Stream entry id (<ms>-<seq>)",
         )
 
-    stream = result_changes_key(settings)
+    # 单个只读 Lua 脚本原子完成：最早项校验 -> 按 cursor/limit 读页 ->
+    # next_cursor 探测（满页时探其后是否还有条目），全程同一快照
+    result = await scripts.result_changes_read(
+        keys=[result_changes_key(settings)],
+        args=[cursor if cursor is not None else "", limit],
+    )
+    if not result[0]:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                "cursor is older than the oldest retained change; "
+                "restart without a cursor to resume from the oldest "
+                "available change"
+            ),
+        )
 
-    # 游标可能已落在保留窗口之外：取当前最早条目，游标更早即返回 410，
-    # 避免从 '-' 起读而静默跳过已裁剪部分
-    if cursor is not None:
-        oldest = await redis.xrange(stream, min="-", max="+", count=1)
-        if oldest and _stream_id_tuple(cursor) < _stream_id_tuple(oldest[0][0]):
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail=(
-                    "cursor is older than the oldest retained change; "
-                    "restart without a cursor to resume from the oldest "
-                    "available change"
-                ),
+    # {1, next_cursor（无更多为 None）, {id, {字段...}}, ...}
+    next_cursor = result[1] or None
+    changes = []
+    for entry in result[2:]:
+        entry_id, raw_fields = entry
+        fields = dict(zip(raw_fields[::2], raw_fields[1::2]))
+        changes.append(
+            ResultChange(
+                id=entry_id,
+                task_key=fields["task_key"],
+                fencing_token=int(fields["fencing"]),
+                committed_at_ms=int(fields["committed_at_ms"]),
+                result=json.loads(fields["result"]),
             )
-
-    # cursor 语义为"上次最后一条"，用 '(' 排除其本身，避免重复 / 漏读
-    min_id = f"({cursor}" if cursor is not None else "-"
-    raw = await redis.xrange(stream, min=min_id, max="+", count=limit)
-
-    changes = [
-        ResultChange(
-            id=entry_id,
-            task_key=fields["task_key"],
-            fencing_token=int(fields["fencing"]),
-            committed_at_ms=int(fields["committed_at_ms"]),
-            result=json.loads(fields["result"]),
         )
-        for entry_id, fields in raw
-    ]
-    # 本页恰好满 limit 时补一次探测，判断后面是否还有变更可翻
-    if len(changes) < limit:
-        next_cursor = None
-    else:
-        probe = await redis.xrange(
-            stream, min=f"({changes[-1].id}", max="+", count=1
-        )
-        next_cursor = changes[-1].id if probe else None
-
     return ResultChangePage(changes=changes, next_cursor=next_cursor)
 
 

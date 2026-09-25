@@ -22,7 +22,11 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 失败（凭据 / result_conflict / stale_dependencies）与相同内容重放不追加 /
 变更含 task_key、防栅序号、提交时间与当次 JSON 结果 / 跨任务键按写入全局
 定序 / cursor + next_cursor 分页不重不漏 / 早于最早保留条目的游标 410 /
-非法 cursor 400、limit 越界 422 / 路由优先于 {task_key} 捕获；
+非法 cursor 400、limit 越界 422 / 路由优先于 {task_key} 捕获 /
+读取侧原子性：最早项校验 + 读页 + next_cursor 判定在同一次原子读取中完成，
+恰满一页时 next_cursor 由同次读取的探测给出（无更多为 null、有新变更则
+指向本页最后一条并恰好衔接），并发裁剪（直连 Redis XTRIM 模拟小保留条数下
+的 MAXLEN 裁剪）后被裁游标 410、仍保留游标按写入顺序衔接不重不漏；
 以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
@@ -207,6 +211,7 @@ def main():
     transfer_checks()
     result_checks()
     result_changes_checks()
+    result_changes_atomic_checks()
     audit_checks()
     limit_checks()
     dependency_checks()
@@ -1033,6 +1038,118 @@ def result_changes_checks():
 def _id_tuple(entry_id):
     ms, seq = entry_id.split("-", 1)
     return int(ms), int(seq)
+
+
+def result_changes_atomic_checks():
+    """/v1/results/changes 原子读取回归（最早项校验 + 读页 + next_cursor 判定
+    在同一次 Redis 原子读取中完成）：
+
+    - 恰满一页：页面条数恰好等于 limit 时，next_cursor 由同一次原子读取内的
+      探测决定——后面没有更多变更为 null，已有新变更则指向本页最后一条，
+      沿它续读恰好衔接、不重不漏；
+    - 并发裁剪：模拟小保留条数下并发提交触发的 MAXLEN 裁剪（默认保留 10000
+      条，公开 API 无法快速构造裁剪，直连 Redis XTRIM 全局流，与并发提交在
+      XADD MAXLEN 时裁掉旧条目等效）——上一页返回时还有效的 next_cursor
+      被裁掉后必须得到 410 而不是 200 静默漏读；仍保留的游标 -> 200 且
+      页面恰好从其后衔接。"""
+    base = f"smoke-changes-atomic:{int(time.time() * 1000)}"
+
+    def stream_tail():
+        """当前全局流最后一条的条目 ID（此前的冒烟提交都在它之前）。"""
+        cursor, last = None, None
+        while True:
+            code, page = fetch_changes(cursor, 200)
+            check("changes-atomic tail page ok", code == 200, f"{code} {page}")
+            if page["changes"]:
+                last = page["changes"][-1]["id"]
+            cursor = page["next_cursor"]
+            if cursor is None:
+                return last
+
+    # ---- 恰满一页：len(changes) == limit 时 next_cursor 由同次原子读取的探测决定
+    k1, k2, k3, k4 = [f"{base}:full:{i}" for i in range(4)]
+    baseline = stream_tail()
+    for i, k in enumerate((k1, k2, k3)):
+        code, c = commit_task_result(k, {"seq": i})
+        check("changes-atomic setup commit",
+              code == 200 and c["committed"], f"{code} {c}")
+
+    # 基线之后恰好 3 条新变更；limit=3 恰好满页且后面没有更多 -> next_cursor 为 null
+    code, p1 = fetch_changes(baseline, 3)
+    check("changes-atomic exactly full page",
+          code == 200 and [c["task_key"] for c in p1["changes"]] == [k1, k2, k3],
+          f"{code} {p1}")
+    check("changes-atomic full page no more -> null cursor",
+          p1["next_cursor"] is None, f"{p1}")
+
+    # 再追加 1 条后重读同一页：仍恰好满页，但探测到后面还有 ->
+    # next_cursor 指向本页最后一条；沿它续读恰好衔接第 4 条，不重不漏
+    code, c = commit_task_result(k4, {"seq": 3})
+    check("changes-atomic setup commit 4",
+          code == 200 and c["committed"], f"{code} {c}")
+    code, p1 = fetch_changes(baseline, 3)
+    check("changes-atomic full page has more -> cursor",
+          code == 200 and [c["task_key"] for c in p1["changes"]] == [k1, k2, k3]
+          and p1["next_cursor"] == p1["changes"][-1]["id"], f"{code} {p1}")
+    code, p2 = fetch_changes(p1["next_cursor"], 3)
+    check("changes-atomic full page chained no dup",
+          code == 200 and [c["task_key"] for c in p2["changes"]] == [k4]
+          and p2["next_cursor"] is None, f"{code} {p2}")
+    # 上一页返回的 next_cursor（k3 的条目 ID），稍后裁剪后应判 410
+    full_page_cursor = p1["next_cursor"]
+
+    # ---- 并发裁剪：被裁掉的游标 -> 410；仍保留的游标 -> 200 恰好衔接
+    t1, t2, t3 = [f"{base}:trim:{i}" for i in range(3)]
+    trim_base = stream_tail()
+    for i, k in enumerate((t1, t2, t3)):
+        code, c = commit_task_result(k, {"trim": i})
+        check("changes-atomic trim setup commit",
+              code == 200 and c["committed"], f"{code} {c}")
+    code, page = fetch_changes(trim_base, 10)
+    check("changes-atomic trim setup page",
+          code == 200 and [c["task_key"] for c in page["changes"]] == [t1, t2, t3],
+          f"{code} {page}")
+    id_t1, id_t2 = (c["id"] for c in page["changes"][:2])
+
+    prefix = os.environ.get("SMOKE_KEY_PREFIX", "lease")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("changes-atomic redis reachable", False, f"{host}:{port} {exc}")
+        return
+    try:
+        # 模拟并发提交的 MAXLEN 裁剪：全局流只保留最新 2 条（t2, t3），
+        # t1 与更早的全部条目（含上一页的 next_cursor）被裁掉
+        r.execute("XTRIM", f"{prefix}:result-changes", "MAXLEN", 2)
+    finally:
+        r.close()
+
+    # 上一页返回时还有效的 next_cursor 已被裁剪 -> 410，而不是 200 静默漏读
+    code, body = fetch_changes(full_page_cursor, 10)
+    check("changes-atomic trimmed next_cursor -> 410",
+          code == 410 and isinstance(body.get("detail"), str), f"{code} {body}")
+    # 刚被裁掉的 t1 游标同样 -> 410
+    code, body = fetch_changes(id_t1, 10)
+    check("changes-atomic trimmed cursor -> 410", code == 410, f"{code} {body}")
+
+    # 仍保留的游标（t2，当前最早保留条目）-> 200，页面恰好从其后衔接：
+    # 不会从最早条目重读（重复 t2），也不会跳过 t3
+    code, page = fetch_changes(id_t2, 10)
+    check("changes-atomic retained cursor chains",
+          code == 200 and [c["task_key"] for c in page["changes"]] == [t3]
+          and page["next_cursor"] is None, f"{code} {page}")
+
+    # 裁剪后流继续工作：新提交追加在尾部，沿保留游标翻页仍不重不漏
+    t4 = f"{base}:trim:3"
+    code, c = commit_task_result(t4, {"trim": 3})
+    check("changes-atomic commit after trim",
+          code == 200 and c["committed"], f"{code} {c}")
+    code, page = fetch_changes(id_t2, 10)
+    check("changes-atomic stream continues after trim",
+          code == 200 and [c["task_key"] for c in page["changes"]] == [t3, t4]
+          and page["next_cursor"] is None, f"{code} {page}")
 
 
 def fetch_events(key, cursor=None, limit=None):

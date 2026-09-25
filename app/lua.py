@@ -78,6 +78,10 @@
   因此一条变更恰好对应结果 Hash 的一次版本推进。
 - retention > 0 时以 XADD MAXLEN 精确裁剪，全局流只保留最新的 retention 条，
   超出部分从最旧变更丢弃；retention = 0 表示不限制。
+- 读取侧（GET /v1/results/changes）由单个只读 Lua 脚本在一次原子调用内完成
+  "最早保留条目校验 -> 按 cursor/limit 读页 -> next_cursor 探测"：三步看到
+  同一快照，保留条数较小、并发提交在读取过程中裁剪旧条目时，失效游标必然
+  被判为 410，而不会在校验与读页之间悄然失效、拿到 200 静默漏读。
 
 按资源键分配并发容量约定（多工作进程共享有上限的处理槽位）：
 - 容量配置键 {prefix}:capacity:{resource_key} 是一个 String（整数权重容量，
@@ -602,6 +606,66 @@ end
 """
     + _RESULT_COMMIT_TAIL_LUA
 )
+
+# 读取全局结果变更流的一页（GET /v1/results/changes）：最早保留条目校验、
+# 按 cursor/limit 的页面读取与 next_cursor 判定在同一次 Lua 调用内原子完成，
+# 三步看到的是同一快照。保留条数较小、并发提交在读取过程中以 MAXLEN 裁剪旧
+# 条目时，不存在"校验通过 -> 裁剪 -> 读页"之间游标悄然失效的窗口——裁剪要么
+# 发生在本次原子读取之前（游标校验立即判 410），要么在其之后（本页按快照
+# 原样返回，下次翻页再按新的最早条目校验），失效游标不会拿到 200 静默漏读。
+# 脚本不做任何写入。
+# KEYS[1] = 全局结果变更流键（{prefix}:result-changes）
+# ARGV[1] = 游标（上次响应的 next_cursor；空串表示无游标，从最早保留条目读起）
+# ARGV[2] = limit（单页最大条数，>= 1，服务端已校验）
+# 游标早于本次快照的最早保留条目（已被 MAXLEN 裁剪）返回 {0}
+# 否则返回 {1, next_cursor（没有更多变更为 false）, 条目...}，
+# 条目原样透传 XRANGE 的 {id, {field, value, ...}} 结构
+RESULT_CHANGES_READ_LUA = """
+local cursor = ARGV[1]
+local limit = tonumber(ARGV[2])
+
+-- 本次原子读取的流快照：最早保留条目是游标有效性的判定基准
+local oldest = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', 1)
+
+-- 游标早于最早保留条目即已失效（其与最早条目之间的变更已被裁剪），
+-- 显式拒绝而不是从更晚位置静默续读；空流没有裁剪基线，按空页处理
+if cursor ~= '' and #oldest > 0 then
+  local function id_parts(id)
+    local dash = string.find(id, '-')
+    return tonumber(string.sub(id, 1, dash - 1)),
+      tonumber(string.sub(id, dash + 1))
+  end
+  local cms, cseq = id_parts(cursor)
+  local oms, oseq = id_parts(oldest[1][1])
+  if cms < oms or (cms == oms and cseq < oseq) then
+    return {0}
+  end
+end
+
+-- 游标语义为"上次最后一条"，用 '(' 排除其本身，按写入顺序续读、不重不漏
+local min_id = '-'
+if cursor ~= '' then
+  min_id = '(' .. cursor
+end
+local raw = redis.call('XRANGE', KEYS[1], min_id, '+', 'COUNT', limit)
+
+-- next_cursor 判定：本页恰好满 limit 时，在同一原子读取内探测其后是否还有
+-- 条目——有则 next_cursor 为本页最后一条 ID，否则为 false（没有更多变更）
+local next_cursor = false
+if #raw == limit and #raw > 0 then
+  local last_id = raw[#raw][1]
+  local probe = redis.call('XRANGE', KEYS[1], '(' .. last_id, '+', 'COUNT', 1)
+  if #probe > 0 then
+    next_cursor = last_id
+  end
+end
+
+local reply = {1, next_cursor}
+for _, entry in ipairs(raw) do
+  reply[#reply + 1] = entry
+end
+return reply
+"""
 
 # 保存任务依赖定义：先按"现有定义"做环检测，再整体替换，全成全败。
 # 依赖定义是一个 Redis List（每项为一个前置任务键，顺序即请求顺序）：
